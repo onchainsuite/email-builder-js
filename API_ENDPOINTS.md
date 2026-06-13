@@ -2,7 +2,11 @@
 
 This document lists the available API endpoints for connecting your frontend.
 
-**Base URL**: `https://api.onchainsuite.com/api/v1`
+**Base URL**: `https://onchain-backend-dvxw.onrender.com/api/v1`
+
+## Revision History
+
+- 2026-06-04: Added Email Builder dynamic variable catalog endpoint documentation and clarified merge tag injection points for Azure email delivery.
 
 ## Authentication (BetterAuth & Custom)
 
@@ -14,17 +18,6 @@ BetterAuth configuration). The `x-api-key` header is optional and used for rate 
   - `Authorization: Bearer <token>`
   - `x-session-token: <token>`
   - Query: `?token=<token>` (or `?sessionToken=<token>`)
-
-For embedded editor clients, the recommended pattern is to use a short-lived editor token issued by:
-
-- `GET /campaigns/{id}/editor-session`
-
-and then authenticate editor calls using:
-
-- `Authorization: Bearer <editorToken>` (recommended)
-- `x-editor-token: <editorToken>` (optional alternative)
-
-All campaign endpoints are organization-scoped via `x-org-id`.
 
 ### Protocol Server-to-Server Auth (Secret Keys)
 
@@ -252,6 +245,52 @@ curl -X POST "$BASE_URL/identity/bind" \
 - `POST /invites/{token}/accept`: Accept an invitation.
   - **Auth**: Requires authenticated user session.
   - **Note**: This endpoint is global (not under `/organizations/{orgId}`).
+
+## Email Builder & Dynamic Variables
+
+These endpoints power the embedded email builder merge-tag picker and define how dynamic variables are injected into emails before sending through Azure Communication Email.
+
+### Variable Catalog (Merge Tag Picker)
+
+- `GET /email-builder/config`: Returns the backend-driven catalog of supported dynamic variables and filters.
+  - **Auth**:
+    - Cookie session (browser, recommended), or
+    - `Authorization: Bearer <better-auth-session-token>` (non-browser), or
+    - `Authorization: Bearer <editorToken>` (campaign editor session token)
+  - **Org context**:
+    - `x-org-id: <orgId>` header, or
+    - derived from the campaign editor token session (when using `editorToken`; include `?campaignId=<id>` if no `x-org-id` header is present)
+  - **Rate Limit**: 60 requests per minute
+  - **Response (shape)**:
+
+```json
+{
+  "success": true,
+  "data": {
+    "version": 1,
+    "syntax": {
+      "placeholder": "{{ path.to.value }}",
+      "escape": "HTML-escaped by default in email HTML bodies (use raw filter to opt out)."
+    },
+    "filters": [{ "name": "default", "args": true }],
+    "groups": [
+      {
+        "id": "profile",
+        "label": "Profile",
+        "items": [{ "key": "profile.firstName", "label": "First name", "type": "string" }]
+      }
+    ]
+  }
+}
+```
+
+### Where Variables Are Resolved (Azure Integration)
+
+- Campaign email sends resolve merge tags before hitting Azure:
+  - `POST /campaigns/{id}/send-test` renders merge tags and sends via Azure.
+  - `POST /campaigns/{id}/launch` (and bulk sends) render merge tags per recipient before sending via Azure.
+- Transactional email sends do not resolve merge tags:
+  - `POST /email/send` expects already-rendered `html`/`text` and forwards them to the Azure send queue/client.
 
 ## Domain & Email
 
@@ -665,8 +704,18 @@ All import/export endpoints are organization-scoped via `x-org-id`.
 - `POST /campaigns`: Create a new campaign.
   - **Body**: `{ name: string, type?: "EMAIL_BLAST" | "DRIP_CAMPAIGN" | "SMART_SENDING", subject?: string, htmlContent?: string, recipients?: any }`
 - `GET /campaigns/{id}`: Get campaign details.
-- `GET /campaigns/{id}/email`: Get campaign email (headers + html + optional editor payload).
-- `PUT /campaigns/{id}/email`: Update campaign email (headers + html + optional editor payload).
+- `GET /campaigns/{id}/email`: Get the canonical persisted campaign email document.
+  - **Response**:
+    `{ id, subject, previewText, senderName, senderEmail, replyToEmail, html, text, missingFields: string[], warnings: string[], source: { campaignId, templateId, renderedAt, recipient }, json?, assets? }`
+- `PUT /campaigns/{id}/email`: Update campaign email inputs and persist the authoritative rendered document.
+  - **Body**:
+    `{ subject?, previewText?, senderName?, senderEmail?, replyToEmail?, html?, textVersion?, json?, assets?, to?, recipient?, contact?, audience? }`
+  - **Notes**:
+    - Re-renders using the backend canonical renderer before persisting.
+    - Normalizes nested editor payload shapes into canonical stored email content when possible.
+    - Stores the authoritative rendered email document used by preview/test-send/send flows.
+  - **Errors**:
+    - `422 EMAIL_RENDER_EMPTY` when canonical rendering still produces no `html` or `text`
 - `PUT /campaigns/{id}`: Update campaign.
 - `DELETE /campaigns/{id}`: Delete a campaign.
 - `POST /campaigns/{id}/autosave`: Autosave campaign draft (frequent saves).
@@ -686,9 +735,20 @@ All import/export endpoints are organization-scoped via `x-org-id`.
 - `POST /campaigns/{id}/editor/saved`: Store editor payload (Body:
   `{ html, json, textVersion, assets }`).
 - `GET /campaigns/{id}/editor/content`: Get latest stored editor payload.
-- `POST /campaigns/{id}/preview`: Render preview payload (Response: `{ html, text }`).
-- `POST /campaigns/{id}/send-test`: Send test email (Body:
-  `{ to: string, subjectOverride?: string }`).
+- `POST /campaigns/{id}/preview`: Render the final email exactly as backend send logic would produce it.
+  - **Body (optional)**:
+    `{ to?: string, recipient?: object, contact?: object, audience?: object, subject?: string, previewText?: string, senderName?: string, senderEmail?: string, replyToEmail?: string, html?: string, textVersion?: string, json?: any, assets?: any }`
+  - **Response**:
+    `{ html, text, missingFields: string[], warnings: string[], source: { campaignId, templateId, renderedAt } }`
+- `POST /campaigns/{id}/send-test`: Render or load the canonical rendered email, validate it, then send a test email.
+  - **Body**:
+    `{ to: string, recipient?: object, contact?: object, audience?: object, subject?: string, previewText?: string, senderName?: string, senderEmail?: string, replyToEmail?: string, html?: string, textVersion?: string, json?: any, assets?: any }`
+  - **Response**:
+    `{ success: true, messageId, renderedAt, htmlLength, textLength }`
+  - **Errors**:
+    - `400 EMAIL_BODY_EMPTY` when rendered `html` and `text` are both empty
+    - `422 EMAIL_PROVIDER_PAYLOAD_INVALID` when provider-required fields are missing
+    - `422 EMAIL_RENDER_VALIDATION_FAILED` when required rendered fields/placeholders remain unresolved
 - `PUT /campaigns/{id}/schedule`: Save schedule settings (Body:
   `{ sendOption: "now" | "schedule", scheduleDate, scheduleTime, timezone }`).
   - If `sendOption="schedule"` then `scheduleDate` is required and must be a future UTC instant (`YYYY-MM-DDTHH:mm:ss.sssZ`).
@@ -787,75 +847,6 @@ Endpoints that accept editor token auth:
 - `PUT /campaigns/{id}/email`
 - `GET /campaigns/{id}/editor/content`
 - `POST /campaigns/{id}/editor/saved`
-
-### Email Builder Variables (Frontend)
-
-The builder should fetch the variable catalog from the backend so the UI mirrors the runtime variable system.
-
-- `GET /email-builder/config`: Get available variable groups for the editor UI.
-  - **Auth**:
-    - Same-site browser: cookie session (`credentials: "include"`) + `x-org-id`
-    - Embedded editor: `Authorization: Bearer <editorToken>` + `x-org-id`
-  - **Response (200)**:
-    - Standard wrapper `{ success, data }` or direct JSON.
-    - `data.groups`: array of groups
-
-Example response:
-
-```json
-{
-  "success": true,
-  "data": {
-    "groups": [
-      {
-        "id": "recipient",
-        "label": "Recipient",
-        "items": [
-          { "key": "recipient.first_name", "label": "First name", "type": "string", "required": false },
-          { "key": "recipient.email", "label": "Email", "type": "string", "required": true }
-        ]
-      },
-      {
-        "id": "wallet",
-        "label": "Wallet",
-        "items": [
-          { "key": "wallet.address", "label": "Wallet address", "type": "address", "required": false },
-          { "key": "wallet.chain_id", "label": "Chain ID", "type": "number", "required": false }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### Dynamic Variable Schemas (Backend)
-
-To prevent runtime send failures, the backend should persist a variable schema (types + required flags + optional defaults)
-alongside each campaign's email content.
-
-- `GET /campaigns/{id}/variable-schema`: Get the variable schema used for this campaign.
-  - **Auth**: cookie session or editor token
-  - **Headers**: `x-org-id: <orgId>`
-  - **Response**: `{ success, data: { version, variables: [...] } }`
-
-- `PUT /campaigns/{id}/variable-schema`: Update the campaign variable schema.
-  - **Auth**: cookie session or editor token
-  - **Headers**: `x-org-id: <orgId>`
-  - **Body**:
-    - `{ version?: number, variables: Array<{ key: string, label?: string, type: string, required?: boolean, default?: any }> }`
-
-Suggested schema shape:
-
-```json
-{
-  "version": 1,
-  "variables": [
-    { "key": "recipient.first_name", "type": "string", "required": false, "default": "there" },
-    { "key": "wallet.address", "type": "address", "required": false },
-    { "key": "tx.hash", "type": "tx_hash", "required": false }
-  ]
-}
-```
 
 Example (builder fetch without cookies):
 
@@ -986,5 +977,3 @@ These endpoints are user-scoped (public templates + your private templates). Aut
 - **Namespace**: `/notifications`
 - **Handshake**: provide token via `handshake.auth.token` or `Authorization: Bearer <token>` header.
 - **Server events**: `notification` (payload is the persisted notification row)
-
-
